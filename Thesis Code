@@ -1,0 +1,1465 @@
+# ============================================================
+#  Cell 1 · Global parameters & imports
+# ============================================================
+import os, sys, glob, platform, warnings, math, re
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+# Reproducibility
+SEED = 42
+np.random.seed(SEED)
+
+# ─── File-system paths (EDIT root only) ─────────────────────
+PROJ_ROOT  = r"C:\Users\Talha\Desktop\thesis project"   # ← change if needed
+RAW_ECDB   = os.path.join(PROJ_ROOT, r"data\raw\ecdb")
+RAW_TRENDS = os.path.join(PROJ_ROOT, r"data\raw\trends")
+RESULT_DIR = os.path.join(PROJ_ROOT, "results")
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+# ─── Analysis window ─────────────────────────────────────────
+DATE_START = pd.Timestamp("2020-01-01")
+
+# ─── Domain bookkeeping ─────────────────────────────────────
+AGG_MAP = {"0815.eu": "0815.at"}     # subsidiary → parent
+
+TREATED = ["0815.at", "moebelfirst.de", "druckerpatronen.de", "winkelstraat.nl"]
+CONTROL = ["chronext.com", "e-tec.at", "watchmaster.com",
+           "yatego.com", "lyra-pet.de", "futterbauer.de"]
+
+ACQ_DATES = {
+    "0815.at":            "2024-11-01",
+    "moebelfirst.de":     "2023-11-01",  # note: post-only in our window
+    "druckerpatronen.de": "2024-04-01",  # not a TPG deal; kept for symmetry (see text)
+    "winkelstraat.nl":    "2024-07-01",
+}
+
+# Convenience: parse to Timestamp
+ACQ_DATES_TS = {k: pd.to_datetime(v) for k, v in ACQ_DATES.items()}
+
+# ─── Quick console confirmation ──────────────────────────────
+print("Python:", sys.version.split()[0], "| OS:", platform.system(), platform.release())
+print("Project root :", PROJ_ROOT)
+print("ECDB folder  :", RAW_ECDB)
+print("Trends folder:", RAW_TRENDS)
+print("Results dir  :", RESULT_DIR)
+print("Treated (%d):"  % len(TREATED),  TREATED)
+print("Control (%d):"  % len(CONTROL),  CONTROL)
+# ============================================================
+#  Cell 2 · Load ECDB monthly sales + Google-Trends interest
+# ============================================================
+import pandas as pd
+
+def load_ecdb(raw_dir: str) -> pd.DataFrame:
+    """Load ECDB workbooks with monthly revenue; return tidy df: [domain, date, sales]."""
+    frames = []
+    pattern = os.path.join(raw_dir, "**", "*net_sales_monthly*.xlsx")
+    for f in glob.glob(pattern, recursive=True):
+        dom = Path(f).name.split("_net_sales")[0]
+        try:
+            df = pd.read_excel(f, sheet_name="MonthlyRevenue")
+        except ValueError:
+            df = pd.read_excel(f, sheet_name=1)
+        df = df[df.iloc[:, 0].astype(str).str.contains("Revenue", case=False, na=False)]
+        df = df.dropna(axis=1, how="all")
+        df_long = (df.melt(id_vars=[df.columns[0]], var_name="date", value_name="sales")
+                     .query("date.str.match('^\\d{2}-\\d{4}$')")
+                     .assign(sales=lambda d: pd.to_numeric(d["sales"], errors="coerce"))
+                     .dropna(subset=["sales"])
+                     .assign(date=lambda d: pd.to_datetime(d["date"], format="%m-%Y"),
+                             domain=dom))
+        frames.append(df_long[["domain", "date", "sales"]])
+    if not frames:
+        raise FileNotFoundError("No ECDB *net_sales_monthly*.xlsx files found.")
+    ecdb = (pd.concat(frames, ignore_index=True)
+              .replace({"domain": AGG_MAP})
+              .groupby(["domain", "date"], as_index=False)
+              .sum())
+    return ecdb
+
+def load_trends_daily(raw_dir: str) -> pd.DataFrame:
+    """Load Trends CSVs (global daily) → tidy df: [domain, date, interest] (daily)."""
+    frames = []
+    pattern = os.path.join(raw_dir, "*_trends.csv")
+    for f in glob.glob(pattern):
+        dom = Path(f).stem.split("_trends")[0]
+        df = (pd.read_csv(f, skiprows=1, names=["date", "interest"])
+                .query("date.str.match('\\d')")
+                .assign(date=lambda d: pd.to_datetime(d["date"]),
+                        domain=dom))
+        frames.append(df)
+    if not frames:
+        raise FileNotFoundError("No *_trends.csv files found.")
+    tr = (pd.concat(frames, ignore_index=True)
+            .replace({"domain": AGG_MAP})
+            .query("date >= @DATE_START"))
+    return tr
+
+ecdb   = load_ecdb(RAW_ECDB)
+trends = load_trends_daily(RAW_TRENDS)
+print("Loaded  ECDB:", ecdb.shape, "   Trends(daily):", trends.shape)
+
+# Save raw loads (optional)
+ecdb.to_csv(os.path.join(RESULT_DIR, "z_raw_ecdb.csv"), index=False)
+trends.to_csv(os.path.join(RESULT_DIR, "z_raw_trends_daily.csv"), index=False)
+# ============================================================
+#  Cell 3 · Monthly aggregation, merge panel, core variables
+# ============================================================
+# Daily Trends → numeric & monthly mean
+trends["interest"] = (trends["interest"].astype(str)
+                      .str.replace(r"<\s*1", "0.5", regex=True)
+                      .str.replace(",", "")
+                      .pipe(pd.to_numeric, errors="coerce"))
+trends = trends.dropna(subset=["interest"])
+
+tr_monthly = (trends.assign(date=lambda d: d["date"].values.astype("datetime64[M]"))
+                     .groupby(["domain", "date"], as_index=False)["interest"].mean())
+
+combo = (ecdb.merge(tr_monthly, on=["domain", "date"], how="left", indicator=True)
+              .rename(columns={"sales": "net_sales_mUS$", "interest": "gtrends"}))
+
+# Sanity report
+missing = combo[combo["_merge"] == "left_only"]
+if not missing.empty:
+    print("⚠️ Months with sales but no Trends reading:")
+    print(missing.groupby("domain").size().to_frame("missing_months"))
+combo = combo.drop(columns="_merge")
+
+# Treatment flags
+combo["treated"] = combo["domain"].isin(ACQ_DATES).astype(int)
+combo["post"]    = combo.apply(
+    lambda r: int(r["treated"] and (r["date"] >= ACQ_DATES_TS[r["domain"]])),
+    axis=1
+)
+
+# Logs
+combo["ln_sales"]  = np.log(combo["net_sales_mUS$"].clip(lower=1e-3))
+combo["ln_trends"] = np.log(combo["gtrends"].fillna(0) + 1)
+
+# Save merged panel
+combo.to_csv(os.path.join(RESULT_DIR, "panel_combo.csv"), index=False)
+
+print("Merged panel shape:", combo.shape)
+print("Domains:", combo['domain'].nunique(), "| Months:", combo['date'].nunique())
+# ============================================================
+#  Cell 4 · Descriptives & Appendix A exports
+# ============================================================
+# Table 3-1: Sample listing
+rows = []
+for d in TREATED + CONTROL:
+    rows.append({"Domain": d, "Treated": int(d in TREATED), "Close date": ACQ_DATES.get(d, "–")})
+tbl_sample = pd.DataFrame(rows)
+tbl_sample.to_excel(os.path.join(RESULT_DIR, "table_3_1_sample.xlsx"), index=False)
+
+# Table 3-2: Variable glossary
+glossary = [
+    {"Variable": "net_sales_mUS$", "Definition": "ECDB monthly net sales (million US$)", "Transformations": "winsorise 1/99 if needed"},
+    {"Variable": "gtrends",        "Definition": "Google Trends monthly avg (global)",   "Transformations": "<1→0.5; daily→monthly mean"},
+    {"Variable": "ln_sales",       "Definition": "ln(net_sales_mUS$ + 0.001)",           "Transformations": "clip lower 1e-3, natural log"},
+    {"Variable": "ln_trends",      "Definition": "ln(gtrends + 1)",                      "Transformations": "natural log"},
+    {"Variable": "treated",        "Definition": "1 if domain has an acquisition",       "Transformations": "hand-coded from ACQ_DATES"},
+    {"Variable": "post",           "Definition": "1 starting first full month after close", "Transformations": "hand-coded timing rule"},
+]
+pd.DataFrame(glossary).to_excel(os.path.join(RESULT_DIR, "table_3_2_glossary.xlsx"), index=False)
+
+# Table 3-3: Summary stats (treated vs control)
+stats = (combo.groupby("treated")[["net_sales_mUS$", "gtrends"]]
+               .agg(["mean", "std", "min", "max"]))
+stats.index = ["Control (0)", "Treated (1)"]
+stats.to_excel(os.path.join(RESULT_DIR, "table_3_3_descriptives.xlsx"))
+print("Saved Table 3-1/2/3 to", RESULT_DIR)
+# ============================================================
+#  Cell 5 · TWFE Difference-in-Differences (baseline)
+# ============================================================
+import os, warnings, time
+import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
+
+# silence the non-fatal covariance/constraints warning
+warnings.filterwarnings("ignore", message="covariance of constraints.*")
+
+def safe_to_excel(df: pd.DataFrame, out_path: str, max_tries: int = 2):
+    """Try to write Excel; if file is locked, write with a suffix instead."""
+    base, ext = os.path.splitext(out_path)
+    for i in range(max_tries + 1):
+        try:
+            df.to_excel(out_path, index=False)
+            return out_path
+        except PermissionError:
+            if i >= max_tries:
+                alt = f"{base}__{int(time.time())}{ext}"
+                df.to_excel(alt, index=False)
+                print(f"⚠️ Target locked; wrote to: {alt}")
+                return alt
+            print(f"⚠️ {os.path.basename(out_path)} is open in Excel. Retry {i+1}/{max_tries} …")
+            time.sleep(0.5)
+
+# Baseline model
+f_base = "ln_sales ~ treated*post + ln_trends + C(domain) + C(date)"
+did = smf.ols(f_base, data=combo).fit(cov_type="cluster",
+                                      cov_kwds={"groups": combo["domain"]})
+
+# Pull ATT
+term_name = "treated:post" if "treated:post" in did.params else [k for k in did.params if ":post" in k][0]
+b  = float(did.params[term_name]); se = float(did.bse[term_name]); p = float(did.pvalues[term_name])
+att_pct = (np.exp(b) - 1) * 100
+print(f"ATT = {b:.4f} log-pts  (~{att_pct:.2f}%),  p = {p:.3f}")
+
+# Export Table 5-1
+t5_1 = did.summary2().tables[1].reset_index().rename(columns={"index":"term"})
+path_51 = os.path.join(RESULT_DIR, "table_5_1_baseline.xlsx")
+safe_to_excel(t5_1, path_51)
+print("✔ Saved Table 5-1 →", os.path.basename(path_51))
+
+# ============================================================
+#  Cell 5a · Functional forms & holiday controls
+#           → Table 5-1a (robustness of baseline ATT)
+# ============================================================
+import numpy as np, pandas as pd, os, statsmodels.formula.api as smf
+from patsy import ModelDesc  # ensures patsy is available for Q()
+
+def _att(res):
+    name = "treated:post" if "treated:post" in res.params else [k for k in res.params if ":post" in k][0]
+    return float(res.params[name]), float(res.bse[name]), float(res.pvalues[name])
+
+rows = []
+
+# Spec 1: Baseline (log sales)
+res = smf.ols("ln_sales ~ treated*post + ln_trends + C(domain) + C(date)", data=combo)\
+        .fit(cov_type="cluster", cov_kwds={"groups": combo["domain"]})
+b,se,p = _att(res)
+rows.append({"Spec": "Baseline (log sales)", "ATT_log": b, "ATT_%": (np.exp(b)-1)*100, "SE": se, "p": p})
+
+# Spec 2: Levels (sales mUS$)  ← Q("net_sales_mUS$")
+res = smf.ols('Q("net_sales_mUS$") ~ treated*post + gtrends + C(domain) + C(date)', data=combo)\
+        .fit(cov_type="cluster", cov_kwds={"groups": combo["domain"]})
+b,se,p = _att(res)
+rows.append({"Spec": "Levels (sales mUS$)", "ATT_log": b, "ATT_%": np.nan, "SE": se, "p": p})
+
+# Spec 3: Growth rate (Δln sales)
+combo_gr = combo.sort_values(["domain","date"]).copy()
+combo_gr["d_ln_sales"] = combo_gr.groupby("domain")["ln_sales"].diff()
+d_ok = combo_gr.dropna(subset=["d_ln_sales"]).copy()
+res = smf.ols("d_ln_sales ~ treated*post + ln_trends + C(domain) + C(date)", data=d_ok)\
+        .fit(cov_type="cluster", cov_kwds={"groups": d_ok["domain"]})
+b,se,p = _att(res)
+rows.append({"Spec": "Growth rate (Δln sales)", "ATT_log": b, "ATT_%": (np.exp(b)-1)*100, "SE": se, "p": p})
+
+# Spec 4: Holiday controls (Nov & Dec dummy)
+combo_h = combo.copy()
+combo_h["holiday"] = combo_h["date"].dt.month.isin([11,12]).astype(int)
+res = smf.ols("ln_sales ~ treated*post + ln_trends + holiday + C(domain) + C(date)", data=combo_h)\
+        .fit(cov_type="cluster", cov_kwds={"groups": combo_h["domain"]})
+b,se,p = _att(res)
+rows.append({"Spec": "Log sales + holiday controls", "ATT_log": b, "ATT_%": (np.exp(b)-1)*100, "SE": se, "p": p})
+
+# Build & export
+tab_51a = pd.DataFrame(rows)
+tab_51a["ATT_log"] = tab_51a["ATT_log"].round(4)
+tab_51a["ATT_%"]   = tab_51a["ATT_%"].round(2)
+tab_51a["SE"]      = tab_51a["SE"].round(4)
+tab_51a["p"]       = tab_51a["p"].round(3)
+
+outpath = os.path.join(RESULT_DIR, "table_5_1a_functional_forms.xlsx")
+tab_51a.to_excel(outpath, index=False)
+print("✔ Saved Table 5-1a →", outpath)
+# ============================================================
+#  Cell 6 · Event-study (baseline)
+# ============================================================
+import matplotlib.pyplot as plt
+
+def month_diff(d1: pd.Timestamp, d2: pd.Timestamp) -> int:
+    return (d1.year - d2.year) * 12 + (d1.month - d2.month)
+
+es = combo.copy()
+es["rel_month"] = es.apply(
+    lambda r: month_diff(r["date"], ACQ_DATES_TS[r["domain"]]) if r["domain"] in ACQ_DATES_TS else np.nan, axis=1
+)
+# Clip to [-4, +5]
+es["rel_clip"] = es["rel_month"].fillna(-1).clip(-4, 5).astype(int)
+
+need = ["ln_sales", "ln_trends", "rel_clip", "treated", "domain", "date"]
+es_cc = es.dropna(subset=need).copy()
+
+formula_es = "ln_sales ~ C(rel_clip, Treatment(reference=-1))*treated + ln_trends + C(domain) + C(date)"
+ev = smf.ols(formula_es, data=es_cc).fit(cov_type="cluster", cov_kwds={"groups": es_cc["domain"]})
+
+# Extract percent effects for plotting
+ks, beta_pct, lo_pct, hi_pct = [], [], [], []
+for k in range(-4, 6):
+    if k == -1: 
+        continue
+    term = f"C(rel_clip, Treatment(reference=-1))[T.{k}]:treated"
+    if term in ev.params:
+        ks.append(k)
+        ci_lo, ci_hi = ev.conf_int().loc[term]
+        beta_pct.append((np.exp(ev.params[term]) - 1) * 100)
+        lo_pct.append((np.exp(ci_lo) - 1) * 100)
+        hi_pct.append((np.exp(ci_hi) - 1) * 100)
+
+# Plot Fig 5-1
+plt.figure(figsize=(8,4))
+plt.plot(ks, beta_pct, marker="o", lw=1.5, label="Point estimate")
+plt.fill_between(ks, lo_pct, hi_pct, alpha=0.25, label="95% CI")
+plt.axhline(0, color="black", lw=1)
+plt.axvline(-0.5, color="grey", ls=":")
+plt.xlabel("Months since closing (k)")
+plt.ylabel("Effect on net sales (%)")
+plt.title("Event-study coefficients (ref k = −1)")
+plt.legend(frameon=False)
+plt.tight_layout()
+plt.savefig(os.path.join(RESULT_DIR, "fig_5_1_event_study.png"), dpi=200)
+plt.close()
+
+# Export ES coefficient table
+ev_tab = ev.summary2().tables[1].reset_index()
+ev_tab.to_excel(os.path.join(RESULT_DIR, "table_5_1b_eventstudy_coefs.xlsx"), index=False)
+print("✔ Saved Fig 5-1 & ES coef table")
+# ============================================================
+#  Cell 7 · Stacked Event Study + Placebo Event Studies (FIXED)
+# ============================================================
+WIN = 5
+
+def month_diff(d1: pd.Timestamp, d2: pd.Timestamp) -> int:
+    return (d1.year - d2.year) * 12 + (d1.month - d2.month)
+
+# ---------- Stacked Event Study ----------
+treated = combo[combo['treated'] == 1].copy()
+treated['rel'] = treated.apply(lambda r: month_diff(r['date'], ACQ_DATES_TS[r['domain']]), axis=1)
+
+# keep only months in ±WIN around each treated close
+keep_months = treated.loc[treated['rel'].between(-WIN, WIN), 'date'].unique()
+stack = combo[combo['date'].isin(keep_months)].copy()
+
+# event-time only for treated; controls get reference bin (-1)
+stack['rel'] = stack.apply(
+    lambda r: month_diff(r['date'], ACQ_DATES_TS.get(r['domain'], pd.NaT)) if r['treated'] == 1 else np.nan,
+    axis=1
+)
+stack['rel_clip'] = stack['rel'].fillna(-1).clip(-WIN, WIN).astype(int)
+
+# FILTERED dataframe for the regression + aligned groups
+df_es2 = stack.dropna(subset=['ln_sales', 'ln_trends']).copy()
+es2 = smf.ols(
+    "ln_sales ~ C(rel_clip, Treatment(reference=-1))*treated + ln_trends + C(domain) + C(date)",
+    data=df_es2
+).fit(cov_type="cluster", cov_kwds={"groups": df_es2['domain']})
+
+# Extract & plot stacked ES
+ks2, b2, l2, h2 = [], [], [], []
+ci2 = es2.conf_int()
+for k in range(-WIN, WIN + 1):
+    if k == -1:
+        continue
+    term = f"C(rel_clip, Treatment(reference=-1))[T.{k}]:treated"
+    if term in es2.params:
+        ks2.append(k)
+        lo, hi = ci2.loc[term]
+        b2.append((np.exp(es2.params[term]) - 1) * 100)
+        l2.append((np.exp(lo) - 1) * 100)
+        h2.append((np.exp(hi) - 1) * 100)
+
+plt.figure(figsize=(8, 4))
+plt.plot(ks2, b2, marker="o", lw=1.5, label="Stacked ES")
+plt.fill_between(ks2, l2, h2, alpha=0.25, label="95% CI")
+plt.axhline(0, color="black", lw=1)
+plt.axvline(-0.5, color="grey", ls=":")
+plt.xlabel("Months since closing (k)")
+plt.ylabel("Effect on net sales (%)")
+plt.title("Stacked event-study (ref k = −1)")
+plt.legend(frameon=False)
+plt.tight_layout()
+plt.savefig(os.path.join(RESULT_DIR, "fig_5_2_stacked_es.png"), dpi=200)
+plt.close()
+
+# ---------- Placebo Event Studies on Controls ----------
+controls = combo[combo['treated'] == 0].copy()
+treated_closes = list(ACQ_DATES_TS.values())
+
+if treated_closes and not controls.empty:
+    pc = controls.copy()
+
+    # assign one fake close per control domain (sampled from treated closes)
+    rng = np.random.default_rng(42)
+    unique_controls = pc['domain'].unique()
+    fake_close_map = {d: rng.choice(treated_closes) for d in unique_controls}
+
+    pc['fake_rel'] = pc.apply(lambda r: month_diff(r['date'], fake_close_map[r['domain']]), axis=1)
+    pc['fake_clip'] = pc['fake_rel'].clip(-WIN, WIN)
+
+    # Keep same calendar-month window as stacked ES to be comparable
+    pc = pc[pc['date'].isin(keep_months)].copy()
+
+    # FILTERED dataframe + aligned groups
+    df_pc = pc.dropna(subset=['ln_sales', 'ln_trends']).copy()
+
+    es_p = smf.ols(
+        "ln_sales ~ C(fake_clip, Treatment(reference=-1)) + ln_trends + C(domain) + C(date)",
+        data=df_pc
+    ).fit(cov_type="cluster", cov_kwds={"groups": df_pc['domain']})
+
+    # Extract placebo path
+    ks3, b3, l3, h3 = [], [], [], []
+    ci_p = es_p.conf_int()
+    for k in range(-WIN, WIN + 1):
+        if k == -1:
+            continue
+        term = f"C(fake_clip, Treatment(reference=-1))[T.{k}]"
+        if term in es_p.params:
+            ks3.append(k)
+            lo, hi = ci_p.loc[term]
+            b3.append((np.exp(es_p.params[term]) - 1) * 100)
+            l3.append((np.exp(lo) - 1) * 100)
+            h3.append((np.exp(hi) - 1) * 100)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(ks3, b3, marker="o", lw=1.2, label="Placebo mean (controls)")
+    plt.fill_between(ks3, l3, h3, alpha=0.25, label="95% CI")
+    plt.axhline(0, color="black", lw=1)
+    plt.axvline(-0.5, color="grey", ls=":")
+    plt.xlabel("Months since fake close (k)")
+    plt.ylabel("Effect on net sales (%)")
+    plt.title("Placebo event studies on controls")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULT_DIR, "fig_5_3_placebo_es.png"), dpi=200)
+    plt.close()
+    print("✔ Saved stacked ES and placebo ES figures")
+else:
+    print("Skipping placebo ES: not enough treated close dates or empty controls.")
+# ============================================================
+#  Cell 8 · Intl-search share (manual CSVs) — robust version
+# ============================================================
+import os, warnings
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----- Paths -----
+MANUAL_REGIONS_DIR = os.path.join(PROJ_ROOT, r"data\raw\trends_regions")
+INTL_DID_XLSX      = os.path.join(RESULT_DIR, "table_5_2_intl_share_did.xlsx")
+INTL_FIG_PNG       = os.path.join(RESULT_DIR, "fig_5_4_intl_share.png")
+INTL_NOTES_TXT     = os.path.join(RESULT_DIR, "fig_5_4_intl_share_NOTES.txt")
+
+# ----- Config -----
+BRANDS = ["0815.at","moebelfirst.de","druckerpatronen.de","winkelstraat.nl"]
+WINDOWS = ["pre","post"]
+HOME_INFO = {
+    "0815.at": {"iso": "AT", "names": ["Austria","Österreich"]},
+    "moebelfirst.de": {"iso": "DE", "names": ["Germany","Deutschland"]},
+    "druckerpatronen.de": {"iso": "DE", "names": ["Germany","Deutschland"]},
+    "winkelstraat.nl": {"iso": "NL", "names": ["Netherlands","Nederland"]},
+}
+
+# ----- Loader -----
+def read_regions_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    cols = {c.lower(): c for c in df.columns}
+    country_col = cols.get("region") or cols.get("country") or list(df.columns)[0]
+    value_col   = cols.get("value")  or list(df.columns)[-1]
+    iso_col     = cols.get("geocode")
+
+    out = pd.DataFrame({
+        "country_name": df[country_col].astype(str),
+        "interest": pd.to_numeric(df[value_col], errors="coerce")
+    })
+    if iso_col:
+        out["country_iso"] = df[iso_col].astype(str)
+    else:
+        out["country_iso"] = np.nan
+    out = out.dropna(subset=["interest"])
+    out = out[~out["country_name"].str.contains("Subregion|Region|Worldwide", case=False, na=False)]
+    return out
+
+frames, missing = [], []
+for dom in BRANDS:
+    for w in WINDOWS:
+        fname = f"{dom}_{w}_regions.csv"
+        fpath = os.path.join(MANUAL_REGIONS_DIR, fname)
+        if not os.path.exists(fpath):
+            missing.append((dom, w, "file_not_found"))
+            continue
+        try:
+            df = read_regions_csv(fpath)
+            df["domain"], df["window"] = dom, w
+            frames.append(df[["domain","window","country_iso","country_name","interest"]])
+        except Exception as e:
+            missing.append((dom, w, f"read_error: {e}"))
+
+if not frames:
+    # Write placeholders
+    pd.DataFrame([{"term":"treated:post","Coef.":"NA (no CSVs found)"}])\
+        .to_excel(INTL_DID_XLSX, index=False)
+    plt.figure(figsize=(7,4)); plt.axis("off")
+    plt.text(0.5,0.5,"Intl-share placeholder:\nNo CSVs found.", ha="center", va="center")
+    plt.savefig(INTL_FIG_PNG, dpi=200); plt.close()
+    with open(INTL_NOTES_TXT,"w") as f: f.write("Missing snapshots: "+str(missing))
+    print("⚠️ No CSVs found; wrote placeholders.")
+else:
+    raw = pd.concat(frames, ignore_index=True)
+
+    # --- Mark home vs intl robustly
+    def is_home_row(row):
+        dom, iso, name = row["domain"], str(row["country_iso"]).upper(), str(row["country_name"]).lower()
+        if iso == HOME_INFO[dom]["iso"]:
+            return True
+        for nm in HOME_INFO[dom]["names"]:
+            if nm.lower() in name:
+                return True
+        return False
+    raw["is_home"] = raw.apply(is_home_row, axis=1)
+
+    # --- Aggregate
+    agg = (raw.groupby(["domain","window","is_home"], as_index=False)["interest"].sum()
+              .pivot(index=["domain","window"], columns="is_home", values="interest"))
+    agg = agg.rename(columns={True:"home", False:"intl"})
+    for col in ["home","intl"]:
+        if col not in agg.columns:
+            agg[col] = 0.0
+    agg = agg.fillna(0.0)
+    agg["den"] = agg["home"] + agg["intl"]
+    agg["intl_share"] = np.where(agg["den"]>0, agg["intl"]/agg["den"], 0.0)
+    intl = agg.reset_index()[["domain","window","intl_share"]]
+
+    # --- Keep only domains with both pre+post
+    complete = (intl.pivot(index="domain", columns="window", values="intl_share")
+                     .dropna(subset=["pre","post"]).index.tolist())
+    intl_c = intl[intl["domain"].isin(complete)].copy()
+
+    notes = []
+    if len(complete) >= 2:
+        import statsmodels.formula.api as smf
+        intl_c["treated"] = intl_c["domain"].isin(BRANDS).astype(int)
+        intl_c["post"]    = (intl_c["window"]=="post").astype(int)
+        did_intl = smf.ols("intl_share ~ treated*post", data=intl_c).fit()
+        did_tab = did_intl.summary2().tables[1].reset_index()
+        did_tab.to_excel(INTL_DID_XLSX, index=False)
+    else:
+        pd.DataFrame([{"term":"treated:post","Coef.":"NA (insufficient complete domains)"}])\
+            .to_excel(INTL_DID_XLSX, index=False)
+        notes.append("Intl-share DiD skipped: fewer than 2 complete domains.")
+
+    # --- Plot
+    plt.figure(figsize=(max(7, 1.6*max(1,len(complete))),4))
+    if complete:
+        for dom in complete:
+            vals = intl_c.query("domain==@dom").set_index("window")["intl_share"]
+            plt.bar([f"{dom}-pre", f"{dom}-post"],
+                    [vals.get("pre",0), vals.get("post",0)], alpha=0.85)
+        plt.ylabel("International search share")
+        plt.title("Pre vs Post Google-Trends share (manual CSVs)")
+        plt.xticks(rotation=45, ha="right")
+    else:
+        plt.axis("off"); plt.text(0.5,0.5,"No complete domains",ha="center",va="center")
+    plt.tight_layout(); plt.savefig(INTL_FIG_PNG, dpi=200); plt.close()
+
+    # --- Notes
+    if missing: notes.append("Missing snapshots: "+", ".join([f"{d}/{w}" for d,w,_ in missing]))
+    with open(INTL_NOTES_TXT,"w") as f: f.write("\n".join(notes) if notes else "Intl-share built successfully.\n")
+
+    print("✔ Intl-share: wrote",
+          os.path.basename(INTL_DID_XLSX),
+          os.path.basename(INTL_FIG_PNG),
+          os.path.basename(INTL_NOTES_TXT))
+# ============================================================
+#  Cell 9 · Volatility Δσ (k=3 months) + placebo test (robust)
+# ============================================================
+import os, math, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --------- Parameters (adjust if you like) ----------
+K_BLOCK    = 3        # months in each pre/post block for σ
+N_DRAWS    = 500      # placebo splits per control domain
+MIN_PER_BL = 2        # minimum points required inside each block
+
+# --------- Helpers ----------
+def _block_sigma(series: pd.Series) -> float:
+    """Std dev of ln(sales) within a block (already log-transformed upstream)."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return float(s.std()) if s.size >= MIN_PER_BL else np.nan
+
+def _domain_delta_sigma(df_dom: pd.DataFrame, close_ts: pd.Timestamp) -> dict:
+    """Compute σ_pre, σ_post, and Δ for one treated domain around close."""
+    d = df_dom.sort_values("date").copy()
+    pre_block  = d.loc[d["date"] <  close_ts].tail(K_BLOCK)
+    post_block = d.loc[d["date"] >= close_ts].head(K_BLOCK)
+    sigma_pre  = _block_sigma(pre_block["ln_sales"])
+    sigma_post = _block_sigma(post_block["ln_sales"])
+    delta = (sigma_post - sigma_pre) if (np.isfinite(sigma_pre) and np.isfinite(sigma_post)) else np.nan
+    return {"sigma_pre": sigma_pre, "sigma_post": sigma_post, "delta": delta,
+            "n_pre": len(pre_block), "n_post": len(post_block)}
+
+def _random_placebo_split(df_dom: pd.DataFrame, k: int) -> float:
+    """
+    Choose a random split index that leaves k obs on both sides.
+    Return Δσ = σ_post - σ_pre for that random split (ln_sales).
+    """
+    d = df_dom.sort_values("date").copy()
+    n = len(d)
+    if n < 2*k + 1:
+        return np.nan
+    valid_idx = np.arange(k, n - k)  # split row is the first of the post block
+    split_row = np.random.choice(valid_idx)
+    pre_block  = d.iloc[split_row - k : split_row]
+    post_block = d.iloc[split_row : split_row + k]
+    sigma_pre  = _block_sigma(pre_block["ln_sales"])
+    sigma_post = _block_sigma(post_block["ln_sales"])
+    if not (np.isfinite(sigma_pre) and np.isfinite(sigma_post)):
+        return np.nan
+    return float(sigma_post - sigma_pre)
+
+# --------- Treated Δσ table ----------
+treated_rows = []
+for dom, close in ACQ_DATES_TS.items():
+    dsub = combo.loc[combo["domain"] == dom, ["domain","date","ln_sales"]].dropna()
+    if dsub.empty:
+        treated_rows.append({"domain": dom, "sigma_pre": np.nan, "sigma_post": np.nan,
+                             "delta": np.nan, "n_pre": 0, "n_post": 0})
+        continue
+    out = _domain_delta_sigma(dsub, close)
+    treated_rows.append({"domain": dom, **out})
+vol_treated = pd.DataFrame(treated_rows)
+
+# Average treated Δσ (only over finite deltas)
+treated_mean_delta = float(vol_treated["delta"].dropna().mean()) if vol_treated["delta"].notna().any() else np.nan
+
+# --------- Placebo Δσ over controls ----------
+control_domains = [d for d in combo["domain"].unique() if d not in ACQ_DATES_TS]
+placebo_deltas = []
+for dom in control_domains:
+    dsub = combo.loc[combo["domain"] == dom, ["domain","date","ln_sales"]].dropna().sort_values("date")
+    if dsub.shape[0] < 2*K_BLOCK + 1:
+        continue
+    for _ in range(N_DRAWS):
+        delta = _random_placebo_split(dsub, K_BLOCK)
+        if np.isfinite(delta):
+            placebo_deltas.append({"domain": dom, "delta": delta})
+
+vol_placebo = pd.DataFrame(placebo_deltas)
+
+# --------- Simple p-value (treated mean vs placebo distribution) ----------
+if np.isfinite(treated_mean_delta) and not vol_placebo.empty:
+    diffs = vol_placebo["delta"].to_numpy()
+    p_right = np.mean(diffs >= treated_mean_delta)
+    p_left  = np.mean(diffs <= treated_mean_delta)
+    p_two_sided = 2 * min(p_right, p_left)
+else:
+    p_right = p_left = p_two_sided = np.nan
+
+# --------- Export table (treated Δσ + summary row) ----------
+tbl_out = vol_treated.copy()
+tbl_out["K_block"] = K_BLOCK
+summary_row = pd.DataFrame([{
+    "domain": "TREATED_MEAN",
+    "sigma_pre": np.nan,
+    "sigma_post": np.nan,
+    "delta": treated_mean_delta,
+    "n_pre": int(tbl_out["n_pre"].sum()),
+    "n_post": int(tbl_out["n_post"].sum()),
+    "K_block": K_BLOCK
+}])
+tbl_out = pd.concat([tbl_out, summary_row], ignore_index=True)
+
+# Save table
+path_tbl = os.path.join(RESULT_DIR, "table_5_3_delta_sigma.xlsx")
+with pd.ExcelWriter(path_tbl, engine="xlsxwriter") as xw:
+    tbl_out.to_excel(xw, sheet_name="treated_deltas", index=False)
+    if not vol_placebo.empty:
+        # also save placebo draws (sample if very large)
+        vol_placebo.to_excel(xw, sheet_name="placebo_draws", index=False)
+    # add a tiny summary sheet
+    pd.DataFrame([{
+        "treated_mean_delta": treated_mean_delta,
+        "p_right": p_right, "p_left": p_left, "p_two_sided": p_two_sided,
+        "K_block": K_BLOCK, "N_placebo": int(len(vol_placebo))
+    }]).to_excel(xw, sheet_name="summary", index=False)
+
+print(f"✔ Saved Table 5-3 → {os.path.basename(path_tbl)}")
+
+# --------- Figure: placebo histogram + treated markers ----------
+plt.figure(figsize=(8, 4.5))
+if not vol_placebo.empty:
+    plt.hist(vol_placebo["delta"], bins=30, alpha=0.6, label="placebo Δσ (controls)")
+else:
+    # Placeholder if no placebo data
+    plt.text(0.5, 0.5, "No placebo draws available\n(too few control months)",
+             ha="center", va="center", transform=plt.gca().transAxes)
+# Vertical lines: per treated domain and mean
+for _, r in vol_treated.dropna(subset=["delta"]).iterrows():
+    plt.axvline(r["delta"], color="tab:orange", lw=1.4, alpha=0.7)
+if np.isfinite(treated_mean_delta):
+    plt.axvline(treated_mean_delta, color="red", lw=2.2, label="treated mean Δσ")
+
+plt.title(f"Change in volatility (σ of ln sales) with K={K_BLOCK}\nTreated vs random placebo splits")
+plt.xlabel("Δσ (post − pre)")
+plt.ylabel("Frequency")
+plt.legend(frameon=False)
+plt.tight_layout()
+path_fig = os.path.join(RESULT_DIR, "fig_5_5_volatility_hist.png")
+plt.savefig(path_fig, dpi=200)
+plt.close()
+print(f"✔ Saved Fig 5-5 → {os.path.basename(path_fig)}")
+
+# --------- NOTES ----------
+notes = []
+# per-domain feasibility notes
+for _, r in vol_treated.iterrows():
+    if (r["n_pre"] < MIN_PER_BL) or (r["n_post"] < MIN_PER_BL) or (not np.isfinite(r["delta"])):
+        notes.append(f"{r['domain']}: insufficient pre/post points for K={K_BLOCK} (n_pre={r['n_pre']}, n_post={r['n_post']}).")
+if vol_placebo.empty:
+    notes.append("No placebo distribution produced (control series too short for the chosen K).")
+else:
+    notes.append(f"Permutation-style p(two-sided) vs placebo = {p_two_sided:.3f} (treated mean Δσ).")
+
+path_notes = os.path.join(RESULT_DIR, "fig_5_5_volatility_NOTES.txt")
+with open(path_notes, "w", encoding="utf-8") as f:
+    f.write("\n".join(notes) if notes else "Volatility analysis completed without issues.\n")
+print(f"✔ Wrote NOTES → {os.path.basename(path_notes)}")
+# ============================================================
+#  Cell 10 · RI for ATT + Leave-one-month-out + MDE  (fixed)
+# ============================================================
+import os, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.formula.api as smf
+
+# ---------- Helpers ----------
+def _fit_twfe(df: pd.DataFrame):
+    """TWFE DiD with domain & month FE; cluster by domain. Returns (model, att_name)."""
+    mod = smf.ols("ln_sales ~ treated*post + ln_trends + C(domain) + C(date)", data=df).fit(
+        cov_type="cluster", cov_kwds={"groups": df["domain"]}
+    )
+    att_name = "treated:post" if "treated:post" in mod.params.index else [k for k in mod.params.index if ":post" in k][0]
+    return mod, att_name
+
+def _att_percent(b):
+    return (np.exp(b) - 1) * 100.0
+
+# Ensure required columns exist
+_need = {"ln_sales","ln_trends","treated","post","domain","date"}
+missing_cols = _need - set(combo.columns)
+if missing_cols:
+    raise RuntimeError(f"Missing columns in 'combo': {missing_cols}. Run earlier cells first.")
+
+# =============== (A) Randomization Inference (label shuffle) ===============
+base, att_key = _fit_twfe(combo)
+att_obs  = float(base.params[att_key])
+se_obs   = float(base.bse[att_key])
+att_pct  = _att_percent(att_obs)
+
+DOMAINS          = combo["domain"].unique()
+treated_domains  = combo.loc[combo["treated"].eq(1), "domain"].unique()
+N_TREATED        = len(treated_domains)
+M_PERM           = 1000
+rng              = np.random.default_rng(123)
+
+atts_perm = []
+for _ in range(M_PERM):
+    fake_treated = set(rng.choice(DOMAINS, size=N_TREATED, replace=False))
+    dshuf = combo.copy()
+    dshuf["treated"] = dshuf["domain"].isin(fake_treated).astype(int)
+    m, k = _fit_twfe(dshuf)
+    atts_perm.append(float(m.params[k]))
+atts_perm = np.array(atts_perm, dtype=float)
+
+p_perm = float((np.abs(atts_perm) >= np.abs(att_obs)).mean())
+
+plt.figure(figsize=(8,4))
+plt.hist(_att_percent(atts_perm), bins=35, alpha=0.65, label="Permutation null (ATT %)")
+plt.axvline(att_pct, color="red", lw=2, label=f"Observed ATT = {att_pct:.2f}%")
+plt.xlabel("ATT under permuted labels (%)"); plt.ylabel("Frequency")
+plt.title("Randomization inference for ATT (DiD)")
+plt.legend(frameon=False); plt.tight_layout()
+ri_fig = os.path.join(RESULT_DIR, "fig_5_6_ri_hist.png")
+plt.savefig(ri_fig, dpi=200); plt.close()
+print("✔ Saved RI figure →", os.path.basename(ri_fig))
+
+# =============== (B) Leave-one-month-out influence plot ====================
+month_list = sorted(combo["date"].unique())
+loo_rows = []
+for m in month_list:
+    d = combo[combo["date"] != m].copy()
+    try:
+        res, name = _fit_twfe(d)
+        loo_rows.append({
+            "drop_month": pd.to_datetime(m).strftime("%Y-%m"),
+            "ATT_log": float(res.params[name]),
+            "ATT_%": _att_percent(float(res.params[name])),
+            "SE_log": float(res.bse[name]),
+            "p": float(res.pvalues[name]),
+            "N": int(res.nobs)
+        })
+    except Exception:
+        loo_rows.append({
+            "drop_month": pd.to_datetime(m).strftime("%Y-%m"),
+            "ATT_log": np.nan, "ATT_%": np.nan, "SE_log": np.nan, "p": np.nan, "N": np.nan
+        })
+
+loo_df = pd.DataFrame(loo_rows)
+
+plt.figure(figsize=(max(9, 0.35*len(loo_df)), 4))
+plt.plot(loo_df["drop_month"], loo_df["ATT_%"], marker="o", lw=1.2)
+plt.axhline(att_pct, color="red", lw=1.5, ls="--", label=f"Baseline ATT = {att_pct:.2f}%")
+plt.xticks(rotation=90); plt.ylabel("ATT estimate (%)")
+plt.title("Leave-one-month-out influence on ATT")
+plt.legend(frameon=False); plt.tight_layout()
+loo_fig = os.path.join(RESULT_DIR, "fig_5_7_month_exclusion.png")
+plt.savefig(loo_fig, dpi=220); plt.close()
+print("✔ Saved month-exclusion figure →", os.path.basename(loo_fig))
+
+# =============== (C) Power / Minimum Detectable Effect (MDE) ===============
+z_alpha = 1.96  # two-sided 5%
+z_power = 0.84  # 80% power
+mde_log = (z_alpha + z_power) * se_obs
+mde_pct = _att_percent(mde_log)
+
+mde_tbl = pd.DataFrame([{
+    "Baseline_SE_log": se_obs,
+    "MDE_log": mde_log,
+    "MDE_%": mde_pct,
+    "Alpha": 0.05,
+    "Power": 0.80,
+    "Permutations": M_PERM,
+    "Perm_p_value": p_perm
+}])
+
+# =============== Save summary tables ========================
+base_tbl = pd.DataFrame([
+    {"Spec": "Baseline TWFE (cluster=domain)", "ATT_log": att_obs, "ATT_%": att_pct,
+     "SE_log": se_obs, "p": float(base.pvalues[att_key]), "N": int(base.nobs)},
+    {"Spec": "Randomization Inference (two-sided p)", "ATT_log": np.nan, "ATT_%": np.nan,
+     "SE_log": np.nan, "p": p_perm, "N": len(atts_perm)},
+])
+loo_tbl = loo_df.assign(Spec="Leave-one-month-out")
+robust_tbl = pd.concat([base_tbl, loo_tbl], ignore_index=True, sort=False)
+
+robust_xlsx = os.path.join(RESULT_DIR, "table_5_4_robustness.xlsx")
+with pd.ExcelWriter(robust_xlsx, engine="openpyxl") as xw:
+    robust_tbl.to_excel(xw, sheet_name="robustness", index=False)
+    pd.DataFrame({"perm_ATT_log": atts_perm, "perm_ATT_%": _att_percent(atts_perm)}).to_excel(
+        xw, sheet_name="ri_draws", index=False
+    )
+print("✔ Saved Table 5-4 →", os.path.basename(robust_xlsx))
+
+mde_xlsx = os.path.join(RESULT_DIR, "table_5_5_mde.xlsx")
+mde_tbl.to_excel(mde_xlsx, index=False)
+print("✔ Saved Table 5-5 (MDE) →", os.path.basename(mde_xlsx))
+# ============================================================
+#  Cell 11 · Heterogeneity: size & export-intensity + subgroup ES (FIXED)
+# ============================================================
+import os, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.formula.api as smf
+
+# ---------- helpers ----------
+def month_diff(d1: pd.Timestamp, d2: pd.Timestamp) -> int:
+    return (d1.year - d2.year) * 12 + (d1.month - d2.month)
+
+def att_from_result(res, hint="treated:post"):
+    name = hint if hint in res.params else [k for k in res.params.index if ":post" in k][0]
+    b, se, p = float(res.params[name]), float(res.bse[name]), float(res.pvalues[name])
+    return name, b, se, p
+
+def pct(x): return (np.exp(x) - 1) * 100
+
+def twfe_att(df, treat_var="treated", post_var="post", dep="ln_sales"):
+    f = f"{dep} ~ {treat_var}*{post_var} + ln_trends + C(domain) + C(date)"
+    res = smf.ols(f, data=df).fit(cov_type="cluster", cov_kwds={"groups": df["domain"]})
+    _, b, se, p = att_from_result(res, hint=f"{treat_var}:{post_var}")
+    return b, se, p, int(res.nobs)
+
+def build_es_plot(df, rel_col, treat_var, title, WIN=5):
+    # Fit ES with reference k=-1 (controls sit in ref bin via rel_clip = -1)
+    df_ok = df.dropna(subset=["ln_sales","ln_trends"]).copy()
+    f = f"ln_sales ~ C({rel_col}, Treatment(reference=-1))*{treat_var} + ln_trends + C(domain) + C(date)"
+    mod = smf.ols(f, data=df_ok).fit(cov_type="cluster", cov_kwds={"groups": df_ok["domain"]})
+    ks, b_pct, lo_pct, hi_pct = [], [], [], []
+    ci = mod.conf_int()
+    for k in range(-WIN, WIN+1):
+        if k == -1: 
+            continue
+        term = f"C({rel_col}, Treatment(reference=-1))[T.{k}]:{treat_var}"
+        if term in mod.params:
+            ks.append(k)
+            lo, hi = ci.loc[term]
+            b_pct.append(pct(mod.params[term]))
+            lo_pct.append(pct(lo))
+            hi_pct.append(pct(hi))
+    plt.plot(ks, b_pct, marker="o", lw=1.4, label=title)
+    plt.fill_between(ks, lo_pct, hi_pct, alpha=0.25)
+    return mod
+
+# ---------- SIZE split (pre-deal ln_sales over last 6 pre months) ----------
+rows_size = []
+pre_means = []
+for dom, close in ACQ_DATES_TS.items():
+    pre = combo[(combo['domain']==dom) & (combo['date'] < close)].sort_values('date').tail(6)
+    if not pre.empty:
+        pre_means.append({'domain': dom, 'pre_mean_ln_sales': pre['ln_sales'].mean()})
+pre_means = pd.DataFrame(pre_means)
+
+if pre_means.empty:
+    warnings.warn("No pre-deal months found for treated domains; skipping size split.")
+    small_set, large_set = set(), set()
+else:
+    med = pre_means['pre_mean_ln_sales'].median()
+    small_set = set(pre_means[pre_means['pre_mean_ln_sales'] <= med]['domain'])
+    large_set = set(pre_means[pre_means['pre_mean_ln_sales'] >  med]['domain'])
+
+def run_subgroup_att(treated_subset, label):
+    if not treated_subset:
+        return {'Group': label, 'ATT_log': np.nan, 'ATT_%': np.nan, 'SE_log': np.nan, 'p': np.nan, 'N': 0}
+    d = combo.copy()
+    d['treat_sub'] = d['domain'].isin(treated_subset).astype(int)
+    d['post_sub']  = d.apply(lambda r: int(r['treat_sub'] and r['date'] >= ACQ_DATES_TS.get(r['domain'], pd.Timestamp.max)), axis=1)
+    b,se,p,N = twfe_att(d, treat_var="treat_sub", post_var="post_sub", dep="ln_sales")
+    return {'Group': label, 'ATT_log': b, 'ATT_%': pct(b), 'SE_log': se, 'p': p, 'N': N}
+
+rows_size.append(run_subgroup_att(small_set, "Small (≤ median pre ln_sales)"))
+rows_size.append(run_subgroup_att(large_set, "Large (> median pre ln_sales)"))
+
+t_size = pd.DataFrame(rows_size)
+t_size_round = t_size.copy()
+for col in ["ATT_log","ATT_%","SE_log","p"]:
+    t_size_round[col] = t_size_round[col].round(4)
+t_size_round.to_excel(os.path.join(RESULT_DIR, "table_5_5a_subgroups_size.xlsx"), index=False)
+print("✔ Saved Table 5-5a (size split) → table_5_5a_subgroups_size.xlsx")
+
+# ---------- Subgroup ES (size) — build treat_sub BEFORE plotting ----------
+def make_es_subgroup_plot(subset, label, WIN=5):
+    if not subset:
+        return None
+    d = combo.copy()
+    d['treat_sub'] = d['domain'].isin(subset).astype(int)
+    d['rel'] = d.apply(lambda r: month_diff(r['date'], ACQ_DATES_TS.get(r['domain'], pd.NaT))
+                       if r['treat_sub']==1 else np.nan, axis=1)
+    d['rel_clip'] = d['rel'].fillna(-1).clip(-WIN, WIN).astype(int)  # controls/others at ref bin
+    return build_es_plot(d, 'rel_clip', 'treat_sub', title=label, WIN=WIN)
+
+plt.figure(figsize=(8,4))
+mods = []
+if small_set:
+    mods.append(make_es_subgroup_plot(small_set, "Small"))
+if large_set:
+    mods.append(make_es_subgroup_plot(large_set, "Large"))
+plt.axhline(0, color="black", lw=1)
+plt.axvline(-0.5, color="grey", ls=":")
+plt.xlabel("Months since closing (k)")
+plt.ylabel("Effect on net sales (%)")
+plt.title("Event-study by size subgroup (ref k = −1)")
+plt.legend(frameon=False)
+plt.tight_layout()
+plt.savefig(os.path.join(RESULT_DIR, "fig_5_8_es_subgroups_size.png"), dpi=200)
+plt.close()
+print("✔ Saved Fig 5-8 (ES by size) → fig_5_8_es_subgroups_size.png")
+
+# ---------- EXPORT-INTENSITY split (if intl cache exists) ----------
+INTL_CACHE_CSV = os.path.join(RESULT_DIR, "z_intl_by_country_snapshots.csv")
+notes_path = os.path.join(RESULT_DIR, "table_5_5b_subgroups_export_NOTES.txt")
+
+def build_pre_intl_share(cache_df):
+    """Compute pre intl_share per treated domain from cached snapshots."""
+    if cache_df.empty:
+        return pd.Series(dtype=float)
+    HOME = {"0815.at":"AT","moebelfirst.de":"DE","druckerpatronen.de":"DE","winkelstraat.nl":"NL"}
+    pre = cache_df[cache_df['window']=='pre'].copy()
+    if pre.empty:
+        return pd.Series(dtype=float)
+    pre = (pre.assign(is_home=lambda d: d["country_iso"]==d["domain"].map(HOME))
+              .groupby(["domain","is_home"], as_index=False)["interest"].sum()
+              .pivot(index="domain", columns="is_home", values="interest")
+              .rename(columns={True:"home", False:"intl"}).fillna(0))
+    pre["den"] = pre["home"] + pre["intl"]
+    pre["intl_share_pre"] = np.where(pre["den"]>0, pre["intl"]/pre["den"], np.nan)
+    return pre["intl_share_pre"]
+
+rows_export = []
+if os.path.exists(INTL_CACHE_CSV):
+    cache_df = pd.read_csv(INTL_CACHE_CSV)
+    pre_share = build_pre_intl_share(cache_df).dropna()
+    if pre_share.empty:
+        with open(notes_path, "w") as f: f.write("No usable pre intl-share snapshots in cache; split skipped.\n")
+        print("Export-intensity split skipped (no pre snapshots).")
+    else:
+        med = pre_share.median()
+        low_export  = set(pre_share[pre_share <= med].index)
+        high_export = set(pre_share[pre_share >  med].index)
+        rows_export.append(run_subgroup_att(low_export,  "Low export (≤ median pre intl-share)"))
+        rows_export.append(run_subgroup_att(high_export, "High export (> median pre intl-share)"))
+        t_export = pd.DataFrame(rows_export)
+        for col in ["ATT_log","ATT_%","SE_log","p"]:
+            t_export[col] = t_export[col].round(4)
+        t_export.to_excel(os.path.join(RESULT_DIR, "table_5_5b_subgroups_export.xlsx"), index=False)
+        print("✔ Saved Table 5-5b (export-intensity split) → table_5_5b_subgroups_export.xlsx")
+else:
+    with open(notes_path, "w") as f: f.write("Intl cache file not found; run Cell 8 to build snapshots.\n")
+    print("Export-intensity split skipped (intl cache not found).")
+# ============================================================
+#  Cell 12 · Interrupted Time-Series (ITS) per treated domain
+#           → Appendix E figures + summary table
+# ============================================================
+import os, math, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+
+ITS_DIR = RESULT_DIR  # keep outputs in your results folder
+
+its_rows = []
+min_obs = 8   # minimum obs to attempt ITS
+hac_lags = 3  # HAC (Newey–West) maxlags
+
+for dom in TREATED:
+    if dom not in ACQ_DATES_TS:
+        warnings.warn(f"{dom}: no close date in ACQ_DATES_TS; skipping ITS.")
+        continue
+
+    d = combo.loc[combo['domain'] == dom].sort_values('date').copy()
+    if len(d) < min_obs:
+        warnings.warn(f"{dom}: too few observations ({len(d)}) for ITS; skipping.")
+        continue
+
+    close = ACQ_DATES_TS[dom]
+
+    # Time index & ITS regressors
+    d['t'] = np.arange(len(d))  # 0,1,2,…
+    # Post starts from first FULL month after closing (same rule as DiD)
+    d['post'] = (d['date'] >= (close + pd.offsets.MonthBegin(1))).astype(int)
+    d['t_post'] = d['t'] * d['post']
+
+    # Regressors: const, trend, post, trend×post, plus ln_trends as control
+    X = sm.add_constant(d[['t', 'post', 't_post', 'ln_trends']])
+    y = d['ln_sales']
+
+    try:
+        ols = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': hac_lags})
+    except Exception as e:
+        warnings.warn(f"{dom}: OLS/HAC fit failed: {e}; skipping.")
+        continue
+
+    # Pull coefficients safely (may not exist if singular)
+    def g(name, attr='params'):
+        arr = getattr(ols, attr)
+        return float(arr.get(name, np.nan)) if hasattr(arr, 'get') else (float(arr[name]) if name in arr else np.nan)
+
+    b_post      = g('post', 'params')
+    b_tpost     = g('t_post', 'params')
+    se_post     = g('post', 'bse')
+    se_tpost    = g('t_post', 'bse')
+    p_post      = g('post', 'pvalues')
+    p_tpost     = g('t_post', 'pvalues')
+    b_trend     = g('t', 'params')
+    b_lntr      = g('ln_trends', 'params')
+    r2          = float(ols.rsquared) if hasattr(ols, 'rsquared') else np.nan
+    nobs        = int(ols.nobs) if hasattr(ols, 'nobs') else len(d)
+
+    # Store summary row (level jump, slope change)
+    its_rows.append({
+        'domain': dom,
+        'nobs': nobs,
+        'close_month': close.strftime('%Y-%m'),
+        'level_jump_post': b_post,
+        'se_level_jump': se_post,
+        'p_level_jump': p_post,
+        'slope_change_tpost': b_tpost,
+        'se_slope_change': se_tpost,
+        'p_slope_change': p_tpost,
+        'pre_trend': b_trend,
+        'coef_ln_trends': b_lntr,
+        'R2': r2
+    })
+
+    # Fitted series and plot
+    d['fitted'] = ols.predict(X)
+
+    plt.figure(figsize=(9, 4))
+    plt.plot(d['date'], d['ln_sales'], marker='o', lw=1.2, label='Actual ln(sales)')
+    plt.plot(d['date'], d['fitted'], lw=1.7, label='ITS fitted')
+    plt.axvline(close, color='k', ls='--', label='Close')
+    # Annotation
+    ann = (f"Level jump (post): {b_post:+.3f} (p={p_post:.3f})\n"
+           f"Slope change (t×post): {b_tpost:+.3f} (p={p_tpost:.3f})")
+    plt.text(0.01, 0.02, ann, transform=plt.gca().transAxes, va='bottom', ha='left')
+
+    plt.title(f"Interrupted time-series — {dom}")
+    plt.ylabel("ln(sales)")
+    plt.legend(frameon=False, loc='upper left')
+    plt.tight_layout()
+
+    fn = f"appendixE_its_{dom.replace('.', '_')}.png"
+    plt.savefig(os.path.join(ITS_DIR, fn), dpi=200)
+    plt.close()
+
+# Export summary table
+its_summary = pd.DataFrame(its_rows)
+if not its_summary.empty:
+    its_summary_round = its_summary.copy()
+    for c in ['level_jump_post','se_level_jump','p_level_jump',
+              'slope_change_tpost','se_slope_change','p_slope_change',
+              'pre_trend','coef_ln_trends','R2']:
+        if c in its_summary_round:
+            its_summary_round[c] = its_summary_round[c].round(4)
+    out_xlsx = os.path.join(ITS_DIR, "appendixE_its_summary.xlsx")
+    its_summary_round.to_excel(out_xlsx, index=False)
+    print("✔ Saved ITS summary →", os.path.basename(out_xlsx))
+else:
+    print("ITS: no treated domain had enough data to estimate models.")
+
+print("✔ ITS figures saved to:", ITS_DIR)
+# ============================================================
+#  Cell 13 · Session info & results manifest (exports + env)
+# ============================================================
+import os, sys, platform, datetime, hashlib, json
+from pathlib import Path
+import pandas as pd
+
+RESULT_DIR = RESULT_DIR  # already set earlier
+
+# --- helper: small hash for files (so changes are detectable) ---
+def file_sha1(path, block_size=65536):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(block_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# --- collect all files in RESULTS dir ---
+files = []
+for p in sorted(Path(RESULT_DIR).glob("*")):
+    if p.is_file():
+        try:
+            files.append({
+                "file": p.name,
+                "size_kb": round(p.stat().st_size/1024, 1),
+                "modified": datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "sha1": file_sha1(p)
+            })
+        except Exception:
+            files.append({
+                "file": p.name,
+                "size_kb": None,
+                "modified": None,
+                "sha1": None
+            })
+
+manifest = pd.DataFrame(files)
+manifest_path = os.path.join(RESULT_DIR, "z_manifest.xlsx")
+manifest.to_excel(manifest_path, index=False)
+
+# --- environment snapshot (Python + key libs) ---
+def safe_ver(modname):
+    try:
+        mod = __import__(modname)
+        return getattr(mod, "__version__", "unknown")
+    except Exception:
+        return "not_installed"
+
+env_info = {
+    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "system": {
+        "python": sys.version.split()[0],
+        "os": f"{platform.system()} {platform.release()}",
+        "machine": platform.machine()
+    },
+    "packages": {
+        "numpy": safe_ver("numpy"),
+        "pandas": safe_ver("pandas"),
+        "statsmodels": safe_ver("statsmodels"),
+        "linearmodels": safe_ver("linearmodels"),
+        "pyfixest": safe_ver("pyfixest"),
+        "matplotlib": safe_ver("matplotlib"),
+        "seaborn": safe_ver("seaborn"),
+        "pytrends": safe_ver("pytrends"),
+        "pdfminer": safe_ver("pdfminer"),
+        "tabulate": safe_ver("tabulate"),
+        "scipy": safe_ver("scipy")
+    }
+}
+
+env_json_path = os.path.join(RESULT_DIR, "z_session_info.json")
+with open(env_json_path, "w", encoding="utf-8") as f:
+    json.dump(env_info, f, indent=2)
+
+# Also write a brief human-readable text
+env_txt_path = os.path.join(RESULT_DIR, "z_session_info.txt")
+with open(env_txt_path, "w", encoding="utf-8") as f:
+    f.write(f"Run completed: {env_info['timestamp']}\n")
+    f.write(f"Python: {env_info['system']['python']}\n")
+    f.write(f"OS: {env_info['system']['os']} ({env_info['system']['machine']})\n")
+    f.write("Packages:\n")
+    for k, v in env_info["packages"].items():
+        f.write(f"  - {k}: {v}\n")
+
+# --- quick sanity ping with key expected artifacts ---
+expected = [
+    "table_5_1_baseline.xlsx",
+    "fig_5_1_event_study.png",
+    "fig_5_2_stacked_es.png",
+    "fig_5_3_placebo_es.png",
+    "table_5_2_intl_share_did.xlsx",      # may be placeholder if pytrends limited
+    "fig_5_4_intl_share.png",             # may be placeholder
+    "table_5_3_delta_sigma.xlsx",
+    "fig_5_5_volatility_hist.png",
+    "fig_5_6_ri_hist.png",
+    "fig_5_7_influence.png",
+    "table_5_4_robustness.xlsx",
+    "table_5_5a_subgroups_size.xlsx",
+    "table_5_5b_subgroups_export.xlsx",   # may not exist if no intl cache
+    "appendixE_its_summary.xlsx"
+]
+missing = [fn for fn in expected if not Path(RESULT_DIR, fn).exists()]
+
+print("✔ Manifest written →", manifest_path)
+print("✔ Session info written →", env_json_path, "and", env_txt_path)
+print(f"Results files in {RESULT_DIR}: {len(manifest)}")
+if missing:
+    print("⚠️ Missing expected artifacts (ok if optional):", ", ".join(missing))
+else:
+    print("All key artifacts present.")
+# ============================================================
+#  Cell 14 · Housekeeping rename for consistency
+# ============================================================
+import os, shutil
+
+old = os.path.join(RESULT_DIR, "fig_5_7_month_exclusion.png")
+new = os.path.join(RESULT_DIR, "fig_5_7_influence.png")
+
+if os.path.exists(old):
+    # use copyfile if you want to keep the old one, or os.rename to move it
+    shutil.copyfile(old, new)
+    print(f"✔ Renamed (copied): {old} → {new}")
+elif os.path.exists(new):
+    print("Already consistent:", new)
+else:
+    print("⚠️ Neither the old nor new file found. Did you run Cell 10?")
+# ============================================================
+#  Cell 15 · Final manifest & wrap-up
+# ============================================================
+import os, datetime, pandas as pd
+from pathlib import Path
+
+# Rebuild manifest after housekeeping (Cell 14)
+files = []
+for p in sorted(Path(RESULT_DIR).glob("*")):
+    if p.is_file():
+        files.append({
+            "file": p.name,
+            "size_kb": round(p.stat().st_size/1024, 1),
+            "modified": datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+manifest_final = pd.DataFrame(files)
+manifest_path_final = os.path.join(RESULT_DIR, "z_manifest_FINAL.xlsx")
+manifest_final.to_excel(manifest_path_final, index=False)
+
+# Print a clean wrap-up summary
+print("===========================================")
+print(" Thesis Results Pipeline – Finalised Run")
+print("===========================================")
+print(f"✔ Final manifest saved → {manifest_path_final}")
+print(f"✔ Total files in results/: {len(manifest_final)}")
+
+# Quick sanity check for the key figures & tables (post-rename)
+key_artifacts = [
+    "table_5_1_baseline.xlsx",
+    "fig_5_1_event_study.png",
+    "fig_5_2_stacked_es.png",
+    "fig_5_3_placebo_es.png",
+    "table_5_2_intl_share_did.xlsx",
+    "fig_5_4_intl_share.png",
+    "table_5_3_delta_sigma.xlsx",
+    "fig_5_5_volatility_hist.png",
+    "fig_5_6_ri_hist.png",
+    "fig_5_7_influence.png",        # <- renamed in Cell 14
+    "table_5_4_robustness.xlsx",
+    "table_5_5a_subgroups_size.xlsx",
+    "table_5_5b_subgroups_export.xlsx",
+    "fig_5_8_es_subgroups_size.png",
+    "appendixE_its_summary.xlsx"
+]
+
+missing = [fn for fn in key_artifacts if not Path(RESULT_DIR, fn).exists()]
+if missing:
+    print("⚠️ Missing (ok if optional):", ", ".join(missing))
+else:
+    print("✔ All expected key artifacts present.")
+
+print("Run completed at:", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+# ============================================================
+#  Cell 16 · Validation & smoke tests (end-to-end checks)
+# ============================================================
+import os, re, json
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+OK = "PASS"
+WARN = "WARN"
+FAIL = "FAIL"
+
+results = []
+
+def mark(status, msg):
+    results.append((status, msg))
+    print(f"[{status}] {msg}")
+
+def exists_nonempty(fname):
+    p = Path(RESULT_DIR, fname)
+    return p.exists() and p.stat().st_size > 0
+
+# ---------- 1) Required files present & non-empty ----------
+required = [
+    "panel_combo.csv",
+    "table_5_1_baseline.xlsx",
+    "fig_5_1_event_study.png",
+    "fig_5_2_stacked_es.png",
+    "fig_5_3_placebo_es.png",
+    "table_5_3_delta_sigma.xlsx",
+    "fig_5_5_volatility_hist.png",
+    "fig_5_6_ri_hist.png",
+    "fig_5_7_influence.png",   # after Cell 14 rename
+    "table_5_4_robustness.xlsx",
+    "table_5_5a_subgroups_size.xlsx",
+    "fig_5_8_es_subgroups_size.png",
+    "appendixE_its_summary.xlsx",
+    "z_manifest_FINAL.xlsx",
+    "z_session_info.json",
+]
+
+for f in required:
+    if exists_nonempty(f):
+        mark(OK, f"Found {f}")
+    else:
+        mark(FAIL, f"Missing or empty: {f}")
+
+# Optional (intl-share may be placeholder)
+optional = [
+    "table_5_2_intl_share_did.xlsx",
+    "fig_5_4_intl_share.png",
+    "table_5_5b_subgroups_export.xlsx",
+]
+for f in optional:
+    if exists_nonempty(f):
+        mark(OK, f"Found optional {f}")
+    else:
+        mark(WARN, f"Optional missing (ok): {f}")
+
+# ---------- 2) Panel sanity checks ----------
+try:
+    df = pd.read_csv(Path(RESULT_DIR, "panel_combo.csv"), parse_dates=["date"])
+    # Columns present
+    needed_cols = {"domain","date","net_sales_mUS$","gtrends","treated","post","ln_sales","ln_trends"}
+    if needed_cols.issubset(df.columns):
+        mark(OK, "panel_combo has expected columns")
+    else:
+        miss = needed_cols - set(df.columns)
+        mark(FAIL, f"panel_combo missing columns: {sorted(miss)}")
+    # Reasonable sizes
+    if df.shape[0] >= 50 and df['domain'].nunique() >= 6:
+        mark(OK, f"panel_combo shape looks reasonable: {df.shape}, domains={df['domain'].nunique()}")
+    else:
+        mark(WARN, f"panel_combo small: {df.shape}, domains={df['domain'].nunique()}")
+except Exception as e:
+    mark(FAIL, f"panel_combo read failed: {e}")
+
+# ---------- 3) Baseline ATT ≈ Robustness Baseline ----------
+try:
+    t51 = pd.read_excel(Path(RESULT_DIR, "table_5_1_baseline.xlsx"))
+    # find the treated:post row (name may vary; look for ':post')
+    term_col = [c for c in t51.columns if c.lower().startswith("term") or c == "index"]
+    if term_col:
+        term_col = term_col[0]
+        trow = t51[t51[term_col].astype(str).str.contains(":post", na=False)]
+        if not trow.empty:
+            b_base = float(trow.iloc[0]["Coef."]) if "Coef." in t51.columns else float(trow.iloc[0][1])
+            mark(OK, f"Baseline Table 5-1 ATT read: {b_base:.6f} (log pts)")
+        else:
+            # some statsmodels outputs label differently; fallback: take last row
+            b_base = float(t51.iloc[-1, 1])
+            mark(WARN, f"Could not find ':post' row; fallback ATT={b_base:.6f}")
+    else:
+        b_base = np.nan
+        mark(FAIL, "No term column in table_5_1_baseline.xlsx")
+except Exception as e:
+    b_base = np.nan
+    mark(FAIL, f"Read baseline table failed: {e}")
+
+try:
+    rob = pd.read_excel(Path(RESULT_DIR, "table_5_4_robustness.xlsx"))
+    base_row = rob[rob["Spec"].str.contains("Baseline", na=False)]
+    if not base_row.empty and "ATT_log" in base_row.columns:
+        b_rob = float(base_row.iloc[0]["ATT_log"])
+        # Tolerance: 1e-6 (log points)
+        if np.isfinite(b_base) and abs(b_base - b_rob) < 1e-4:
+            mark(OK, f"ATT consistency: Table 5-1 vs Table 5-4 match (Δ={b_base - b_rob:+.2e})")
+        else:
+            mark(WARN, f"ATT mismatch Table 5-1 vs 5-4: {b_base} vs {b_rob} (Δ={b_base - b_rob:+.2e})")
+    else:
+        mark(WARN, "Robustness table baseline row not found or no ATT_log column")
+except Exception as e:
+    mark(FAIL, f"Read robustness table failed: {e}")
+
+# ---------- 4) Event-study coefficients table presence ----------
+try:
+    es_tab = pd.read_excel(Path(RESULT_DIR, "table_5_1b_eventstudy_coefs.xlsx"))
+    # Look for terms like C(rel_clip...)[T.k]:treated (k=-4..5, excluding -1)
+    has_any = es_tab.iloc[:,0].astype(str).str.contains(r"\[T\.", regex=True).any()
+    if has_any:
+        mark(OK, "Event-study coefficient table present with lead/lag terms")
+    else:
+        mark(WARN, "Event-study coefficient table found but no lead/lag terms detected")
+except Exception as e:
+    mark(WARN, f"Event-study coef table not found/readable (ok if you skipped export): {e}")
+
+# ---------- 5) Volatility & ITS summaries ----------
+try:
+    vol = pd.read_excel(Path(RESULT_DIR, "table_5_3_delta_sigma.xlsx"))
+    if not vol.empty and {"domain","delta"}.issubset(vol.columns):
+        mark(OK, f"Volatility Δσ table present with {len(vol)} treated rows")
+    else:
+        mark(WARN, "Volatility table present but missing expected columns")
+except Exception as e:
+    mark(FAIL, f"Volatility table read failed: {e}")
+
+try:
+    its = pd.read_excel(Path(RESULT_DIR, "appendixE_its_summary.xlsx"))
+    if not its.empty and "domain" in its.columns:
+        mark(OK, f"ITS summary present with {len(its)} rows")
+    else:
+        mark(WARN, "ITS summary present but empty/unexpected columns")
+except Exception as e:
+    mark(FAIL, f"ITS summary read failed: {e}")
+
+# ---------- 6) Figures exist & non-empty ----------
+figs = [
+    "fig_5_1_event_study.png",
+    "fig_5_2_stacked_es.png",
+    "fig_5_3_placebo_es.png",
+    "fig_5_4_intl_share.png",
+    "fig_5_5_volatility_hist.png",
+    "fig_5_6_ri_hist.png",
+    "fig_5_7_influence.png",
+    "fig_5_8_es_subgroups_size.png",
+]
+for f in figs:
+    if exists_nonempty(f):
+        mark(OK, f"Figure ok: {f}")
+    else:
+        mark(WARN, f"Figure missing/empty (may be optional): {f}")
+
+# ---------- 7) Print compact summary ----------
+tot_ok  = sum(1 for s, _ in results if s == OK)
+tot_wrn = sum(1 for s, _ in results if s == WARN)
+tot_fail= sum(1 for s, _ in results if s == FAIL)
+
+print("\n======== VALIDATION SUMMARY ========")
+print(f"PASS: {tot_ok}   WARN: {tot_wrn}   FAIL: {tot_fail}")
+if tot_fail == 0:
+    print("Overall status: ✅ READY")
+else:
+    print("Overall status: ⚠️  CHECK FAILURES ABOVE")
